@@ -1,0 +1,16 @@
+
+QGroupBox {
+    border: 2px solid gray;
+    }
+
+QPushButton#SaveBtn{color:black;
+            background-color:rgb(255, 215, 0);
+            border-radius:6px}
+QPushButton#ExitBtn{color:black;
+            background-color:rgb(255, 215, 0);
+            border-radius:6px}
+QPushButton:hover{color:red}
+QPushButton:pressed{background-color:rgb(180,180,180);border: None;}
+
+
+#MainWindow{border-image:url(UIProgram/ui_imgs/bg22.png)}

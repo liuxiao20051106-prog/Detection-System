@@ -1,0 +1,13 @@
+<RCC>
+  <qresource prefix="icons">
+    <file>ui_imgs/icons/目标检测.png</file>
+    <file>ui_imgs/icons/保存.png</file>
+    <file>ui_imgs/icons/退出.png</file>
+    <file>ui_imgs/icons/camera.png</file>
+    <file>ui_imgs/icons/folder.png</file>
+    <file>ui_imgs/icons/img.png</file>
+    <file>ui_imgs/icons/video.png</file>
+    <file>ui_imgs/11.png</file>
+  </qresource>
+  <qresource prefix="bgs"/>
+</RCC>
