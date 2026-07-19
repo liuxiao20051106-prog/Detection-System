@@ -1,7 +1,13 @@
-import os
+"""使用当前 Python 环境安装项目依赖。"""
 
-pkgs = ['ultralytics','PyQt5==5.15.2','pyqt5-tools==5.15.2.3.1']
+import subprocess
+import sys
+from pathlib import Path
 
-for each in pkgs:
-    cmd_line = f"pip install {each} -i https://pypi.tuna.tsinghua.edu.cn/simple"
-    os.system(cmd_line)
+
+if __name__ == '__main__':
+    requirements = Path(__file__).resolve().with_name('requirements.txt')
+    subprocess.run(
+        [sys.executable, '-m', 'pip', 'install', '-r', str(requirements)],
+        check=True,
+    )

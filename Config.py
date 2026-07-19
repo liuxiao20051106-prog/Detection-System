@@ -1,10 +1,15 @@
-#coding:utf-8
+"""项目运行配置。"""
 
-# 图片及视频检测结果保存路径
-save_path = 'save_data'
+import os
+from pathlib import Path
 
-# 使用的模型路径
-model_path = 'models/best.pt'
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+
+# 可通过环境变量覆盖，便于部署到不同机器。
+save_path = str(Path(os.getenv("DETECTION_SAVE_PATH", PROJECT_ROOT / "save_data")).expanduser().resolve())
+model_path = str(Path(os.getenv("DETECTION_MODEL_PATH", PROJECT_ROOT / "models" / "best.pt")).expanduser().resolve())
+font_path = str(PROJECT_ROOT / "Font" / "platech.ttf")
 
 names = {
     0: 'immature',
