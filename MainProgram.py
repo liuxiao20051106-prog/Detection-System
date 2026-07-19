@@ -1,27 +1,23 @@
 # -*- coding: utf-8 -*-
-import time
-from PyQt5.QtWidgets import QApplication, QMainWindow, QFileDialog, \
-    QMessageBox, QWidget, QHeaderView, QTableWidgetItem, QAbstractItemView, QStackedWidget
-import sys
 import os
-from PIL import ImageFont
-from ultralytics import YOLO
-sys.path.append('UIProgram')
-from UIProgram.UiMain import Ui_MainWindow
 import sys
-from PyQt5.QtCore import QTimer, Qt, QThread, pyqtSignal,QCoreApplication
-import detect_tools as tools
+import time
+
 import cv2
-import Config
-from UIProgram.QssLoader import QSSLoader
-from UIProgram.precess_bar import ProgressBar
-import numpy as np
 import torch
-from login_widget import LoginWidget
-import hashlib  # 用于密码哈希
-from PyQt5.QtWidgets import QStackedWidget, QMessageBox  # 用于界面管理和消息框
-import UIProgram.ui_sources_rc
-from UIProgram import ui_sources_rc
+from PIL import ImageFont
+from PyQt5.QtCore import QCoreApplication, QThread, QTimer, Qt, pyqtSignal
+from PyQt5.QtWidgets import (QAbstractItemView, QApplication, QFileDialog,
+                             QHeaderView, QMainWindow, QMessageBox,
+                             QTableWidgetItem)
+from ultralytics import YOLO
+
+import Config
+import detect_tools as tools
+from UIProgram.QssLoader import QSSLoader
+from UIProgram.UiMain import Ui_MainWindow
+from UIProgram.precess_bar import ProgressBar
+from UIProgram import ui_sources_rc  # noqa: F401 - 注册 Qt 资源
 
 
 class MainWindow(QMainWindow, Ui_MainWindow):
@@ -36,7 +32,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         self.signalconnect()
 
         # 加载css渲染效果
-        style_file = 'UIProgram/style.css'
+        style_file = os.path.join(Config.PROJECT_ROOT, 'UIProgram', 'style.css')
         qssStyleSheet = QSSLoader.read_qss_file(style_file)
         self.setStyleSheet(qssStyleSheet)
 
@@ -81,16 +77,23 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
         self.device = 0 if torch.cuda.is_available() else 'cpu'
 
+        os.makedirs(Config.save_path, exist_ok=True)
+        if not os.path.isfile(Config.model_path):
+            raise FileNotFoundError(
+                f"未找到模型文件：{Config.model_path}\n"
+                "请将模型放入 models/best.pt，或设置 DETECTION_MODEL_PATH。"
+            )
+
         # 加载检测模型
         self.model = YOLO(Config.model_path, task='detect')
-        self.model(np.zeros((48, 48, 3)), device=self.device)  #预先加载推理模型
-        self.fontC = ImageFont.truetype("Font/platech.ttf", 25, 0)
+        self.fontC = ImageFont.truetype(Config.font_path, 25, 0)
 
         # 用于绘制不同颜色矩形框
         self.colors = tools.Colors()
 
         # 更新视频图像
         self.timer_camera = QTimer()
+        self.timer_camera.timeout.connect(self.open_frame)
 
         # 更新检测信息表格
         # self.timer_info = QTimer()
@@ -217,10 +220,11 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         if not  directory:
             return
         self.org_path = directory
-        img_suffix = ['jpg','png','jpeg','bmp']
-        for file_name in os.listdir(directory):
-            full_path = os.path.join(directory,file_name)
-            if os.path.isfile(full_path) and file_name.split('.')[-1].lower() in img_suffix:
+        image_files = tools.list_image_files(directory)
+        if not image_files:
+            QMessageBox.information(self, '提示', '所选文件夹中没有支持的图片。')
+            return
+        for full_path in image_files:
                 # self.comboBox.setDisabled(False)
                 img_path = full_path
                 self.org_img = tools.img_cvread(img_path)
@@ -335,7 +339,11 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         return now_img
 
     def combox_change(self):
+        if not getattr(self, 'location_list', None):
+            return
         com_text = self.comboBox.currentText()
+        if not com_text:
+            return
         if com_text == '全部':
             cur_box = self.location_list
             cur_img = self.results.plot()
@@ -379,7 +387,6 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
         # 定时器开启，每隔一段时间，读取一帧
         self.timer_camera.start(1)
-        self.timer_camera.timeout.connect(self.open_frame)
 
     def tabel_info_show(self, locations, clses, confs, path=None):
         path = path
@@ -408,8 +415,10 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         self.tableWidget.scrollToBottom()
 
     def video_stop(self):
-        self.cap.release()
         self.timer_camera.stop()
+        if self.cap is not None:
+            self.cap.release()
+        self.cap = None
         # self.timer_info.stop()
 
     def open_frame(self):
@@ -477,8 +486,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             self.tabel_info_show(self.location_list, self.cls_list, self.conf_list, path=self.org_path)
 
         else:
-            self.cap.release()
-            self.timer_camera.stop()
+            self.video_stop()
 
     def vedio_show(self):
         if self.is_camera_open:
@@ -489,6 +497,11 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         if not video_path:
             return None
         self.cap = cv2.VideoCapture(video_path)
+        if not self.cap.isOpened():
+            self.cap.release()
+            self.cap = None
+            QMessageBox.warning(self, '打开失败', '无法打开所选视频，请检查文件是否损坏或编码是否受支持。')
+            return
         self.video_start()
         self.comboBox.setDisabled(True)
 
@@ -497,6 +510,13 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         if self.is_camera_open:
             self.CaplineEdit.setText('摄像头开启')
             self.cap = cv2.VideoCapture(0)
+            if not self.cap.isOpened():
+                self.cap.release()
+                self.cap = None
+                self.is_camera_open = False
+                self.CaplineEdit.setText('摄像头未开启')
+                QMessageBox.warning(self, '打开失败', '无法打开摄像头，请检查设备连接和占用情况。')
+                return
             self.video_start()
             self.comboBox.setDisabled(True)
         else:
@@ -534,8 +554,10 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                 self.video_stop()
                 com_text = self.comboBox.currentText()
                 self.btn2Thread_object = btn2Thread(self.org_path, self.model, com_text,self.conf_thres,self.iou_thres)
-                self.btn2Thread_object.start()
                 self.btn2Thread_object.update_ui_signal.connect(self.update_process_bar)
+                self.btn2Thread_object.completed_signal.connect(self.video_save_completed)
+                self.btn2Thread_object.error_signal.connect(self.video_save_failed)
+                self.btn2Thread_object.start()
             else:
                 return
         else:
@@ -545,39 +567,45 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                 save_name = name + '_detect_result.' + end_name
                 save_img_path = os.path.join(Config.save_path, save_name)
                 # 保存图片
-                cv2.imwrite(save_img_path, self.draw_img)
+                tools.img_cvwrite(save_img_path, self.draw_img)
                 QMessageBox.about(self, '提示', '图片保存成功!\n文件路径:{}'.format(save_img_path))
             else:
-                img_suffix = ['jpg', 'png', 'jpeg', 'bmp']
-                for file_name in os.listdir(self.org_path):
-                    full_path = os.path.join(self.org_path, file_name)
-                    if os.path.isfile(full_path) and file_name.split('.')[-1].lower() in img_suffix:
-                        name, end_name = file_name.rsplit(".",1)
-                        save_name = name + '_detect_result.' + end_name
-                        save_img_path = os.path.join(Config.save_path, save_name)
-                        results = self.model(full_path,conf=self.conf_thres, iou=self.iou_thres)[0]
-                        now_img = results.plot()
-                        # 保存图片
-                        cv2.imwrite(save_img_path, now_img)
+                for full_path in tools.list_image_files(self.org_path):
+                    file_name = os.path.basename(full_path)
+                    name, end_name = file_name.rsplit(".",1)
+                    save_name = name + '_detect_result.' + end_name
+                    save_img_path = os.path.join(Config.save_path, save_name)
+                    results = self.model(full_path,conf=self.conf_thres, iou=self.iou_thres)[0]
+                    now_img = results.plot()
+                    # 保存图片
+                    tools.img_cvwrite(save_img_path, now_img)
 
                 QMessageBox.about(self, '提示', '图片保存成功!\n文件路径:{}'.format(Config.save_path))
 
 
     def update_process_bar(self,cur_num, total):
-        if cur_num == 1:
+        if not hasattr(self, 'progress_bar') or self.progress_bar is None:
             self.progress_bar = ProgressBar(self)
             self.progress_bar.show()
-        if cur_num >= total:
-            self.progress_bar.close()
-            QMessageBox.about(self, '提示', '视频保存成功!\n文件在{}目录下'.format(Config.save_path))
-            return
         if self.progress_bar.isVisible() is False:
             # 点击取消保存时，终止进程
             self.btn2Thread_object.stop()
             return
-        value = int(cur_num / total *100)
+        value = int(cur_num / max(total, 1) * 100)
         self.progress_bar.setValue(cur_num, total, value)
         QApplication.processEvents()
+
+    def video_save_completed(self, save_path):
+        if getattr(self, 'progress_bar', None) is not None:
+            self.progress_bar.close()
+            self.progress_bar = None
+        QMessageBox.about(self, '提示', f'视频保存成功!\n文件路径:{save_path}')
+
+    def video_save_failed(self, message):
+        if getattr(self, 'progress_bar', None) is not None:
+            self.progress_bar.close()
+            self.progress_bar = None
+        QMessageBox.critical(self, '视频保存失败', message)
 
     # 添加新的槽函数
     def update_conf_thres(self, value):
@@ -586,7 +614,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         if hasattr(self, 'model'):
             self.model.conf = value
             # 如果当前有图片，重新检测
-            if hasattr(self, 'org_img'):
+            if self.cap is None and hasattr(self, 'org_img'):
                 self.detect_current_image()
 
     def update_iou_thres(self, value):
@@ -595,7 +623,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         if hasattr(self, 'model'):
             self.model.iou = value
             # 如果当前有图片，重新检测
-            if hasattr(self, 'org_img'):
+            if self.cap is None and hasattr(self, 'org_img'):
                 self.detect_current_image()
 
     def update_show_labels(self, state):
@@ -682,6 +710,15 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         self.label_show.setPixmap(pix_img)
         self.label_show.setAlignment(Qt.AlignCenter)
 
+    def closeEvent(self, event):
+        """关闭窗口时释放摄像头、视频和后台保存线程。"""
+        self.video_stop()
+        worker = getattr(self, 'btn2Thread_object', None)
+        if worker is not None and worker.isRunning():
+            worker.stop()
+            worker.wait(3000)
+        event.accept()
+
 
 class btn2Thread(QThread):
     """
@@ -689,6 +726,8 @@ class btn2Thread(QThread):
     """
     # 声明一个信号
     update_ui_signal = pyqtSignal(int,int)
+    completed_signal = pyqtSignal(str)
+    error_signal = pyqtSignal(str)
 
     def __init__(self, path, model, com_text,conf,iou):
         super(btn2Thread, self).__init__()
@@ -702,47 +741,42 @@ class btn2Thread(QThread):
         self.is_running = True  # 标志位，表示线程是否正在运行
 
     def run(self):
-        # VideoCapture方法是cv2库提供的读取视频方法
-        cap = cv2.VideoCapture(self.org_path)
-        # 设置需要保存视频的格式"xvid"
-        # 该参数是MPEG-4编码类型，文件名后缀为.avi
-        fourcc = cv2.VideoWriter_fourcc(*'XVID')
-        # 设置视频帧频
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        # 设置视频大小
-        size = (int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
-        # VideoWriter方法是cv2库提供的保存视频方法
-        # 按照设置的格式来out输出
-        fileName = os.path.basename(self.org_path)
-        name, end_name = fileName.split('.')
-        save_name = name + '_detect_result.avi'
-        save_video_path = os.path.join(Config.save_path, save_name)
-        out = cv2.VideoWriter(save_video_path, fourcc, fps, size)
+        cap = None
+        out = None
+        save_video_path = ''
+        try:
+            cap = cv2.VideoCapture(self.org_path)
+            if not cap.isOpened():
+                raise RuntimeError('无法读取原视频。')
+            fourcc = cv2.VideoWriter_fourcc(*'XVID')
+            fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+            size = (int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+            name = os.path.splitext(os.path.basename(self.org_path))[0]
+            save_video_path = os.path.join(Config.save_path, name + '_detect_result.avi')
+            out = cv2.VideoWriter(save_video_path, fourcc, fps, size)
+            if not out.isOpened():
+                raise RuntimeError(f'无法创建输出视频：{save_video_path}')
 
-        prop = cv2.CAP_PROP_FRAME_COUNT
-        total = int(cap.get(prop))
-        print("[INFO] 视频总帧数：{}".format(total))
-        cur_num = 0
-
-        # 确定视频打开并循环读取
-        while (cap.isOpened() and self.is_running):
-            cur_num += 1
-            print('当前第{}帧，总帧数{}'.format(cur_num, total))
-            # 逐帧读取，ret返回布尔值
-            # 参数ret为True 或者False,代表有没有读取到图片
-            # frame表示截取到一帧的图片
-            ret, frame = cap.read()
-            if ret == True:
-                # 检测
-                results = self.model(frame,conf=self.conf,iou=self.iou)[0]
-                frame = results.plot()
-                out.write(frame)
+            total = max(int(cap.get(cv2.CAP_PROP_FRAME_COUNT)), 1)
+            cur_num = 0
+            while cap.isOpened() and self.is_running:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                cur_num += 1
+                results = self.model(frame, conf=self.conf, iou=self.iou)[0]
+                out.write(results.plot())
                 self.update_ui_signal.emit(cur_num, total)
-            else:
-                break
-        # 释放资源
-        cap.release()
-        out.release()
+
+            if self.is_running:
+                self.completed_signal.emit(save_video_path)
+        except Exception as exc:
+            self.error_signal.emit(str(exc))
+        finally:
+            if cap is not None:
+                cap.release()
+            if out is not None:
+                out.release()
 
     def stop(self):
         self.is_running = False

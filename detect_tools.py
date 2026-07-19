@@ -48,6 +48,29 @@ def img_cvread(path):
     return img
 
 
+def img_cvwrite(path, image):
+    """保存图片并兼容 Windows 中文路径。"""
+    if image is None:
+        raise ValueError("没有可保存的图片")
+    extension = os.path.splitext(os.fspath(path))[1] or '.png'
+    success, encoded = cv2.imencode(extension, image)
+    if not success:
+        raise OSError(f"无法编码图片：{path}")
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    encoded.tofile(path)
+    return os.fspath(path)
+
+
+def list_image_files(directory):
+    """返回目录下按名称排序的受支持图片，不递归读取。"""
+    extensions = {'.jpg', '.jpeg', '.png', '.bmp'}
+    with os.scandir(directory) as entries:
+        return [
+            entry.path for entry in sorted(entries, key=lambda item: item.name.lower())
+            if entry.is_file() and os.path.splitext(entry.name)[1].lower() in extensions
+        ]
+
+
 def draw_boxes(img, boxes):
     for each in boxes:
         x1 = each[0]
@@ -60,10 +83,13 @@ def draw_boxes(img, boxes):
 
 
 def cvimg_to_qpiximg(cvimg):
+    if cvimg is None or cvimg.ndim != 3 or cvimg.shape[2] != 3:
+        raise ValueError("cvimg 必须是 H×W×3 的 BGR 图像")
     height, width, depth = cvimg.shape
-    cvimg = cv2.cvtColor(cvimg, cv2.COLOR_BGR2RGB)
+    cvimg = np.ascontiguousarray(cv2.cvtColor(cvimg, cv2.COLOR_BGR2RGB))
     qimg = QImage(cvimg.data, width, height, width * depth, QImage.Format_RGB888)
-    qpix_img = QPixmap(qimg)
+    # QImage 默认引用 numpy 内存；copy 可避免函数返回后出现花屏或崩溃。
+    qpix_img = QPixmap(qimg.copy())
     return qpix_img
 
 
@@ -133,10 +159,12 @@ def insert_rows(path, lines ,header):
         no_header = True
         start_num = 1
     else:
-        start_num = len(open(path).readlines())
+        with open(path, encoding='utf-8-sig') as csv_file:
+            start_num = sum(1 for _ in csv_file)
 
     csv_head = header
-    with open(path, 'a', newline='') as f:
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, 'a', newline='', encoding='utf-8-sig') as f:
         csv_write = csv.writer(f)
         if no_header:
             csv_write.writerow(csv_head)  # 写入表头
@@ -207,7 +235,7 @@ def draw_yolo_data(img_path, yolo_file_path):
             temp = each.split()
             # ['1', '0.43906', '0.52083', '0.34687', '0.15']
             # YOLO转换为两点坐标x1, x2, y1, y2
-            x_, y_, w_, h_ = eval(temp[1]), eval(temp[2]), eval(temp[3]), eval(temp[4])
+            x_, y_, w_, h_ = map(float, temp[1:5])
             x1, y1, x2, y2 = yolo_to_location(w,h,[x_, y_, w_, h_])
             # 画图验证框是否正确
             cv2.rectangle(img, (x1, y1), (x2, y2), (0, 0, 255))
