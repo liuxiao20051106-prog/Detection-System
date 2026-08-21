@@ -1,7 +1,13 @@
-from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QLineEdit,
-                             QPushButton, QLabel, QMessageBox, QApplication)
-from PyQt5.QtCore import pyqtSignal, Qt
-from PyQt5.QtGui import QFont
+from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt5.QtWidgets import (
+    QApplication,
+    QLabel,
+    QLineEdit,
+    QMessageBox,
+    QPushButton,
+    QVBoxLayout,
+    QWidget,
+)
 
 
 class LoginWidget(QWidget):

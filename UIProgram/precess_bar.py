@@ -1,11 +1,17 @@
 # -*- coding: utf-8 -*-
 # 进度条
-from PyQt5.QtWidgets import QDialog, QLabel, QProgressBar, QPushButton, QVBoxLayout, QHBoxLayout
+from PyQt5.QtCore import pyqtSignal
+from PyQt5.QtWidgets import QDialog, QHBoxLayout, QLabel, QProgressBar, QPushButton, QVBoxLayout
 
 
 class ProgressBar(QDialog):
+    cancel_requested = pyqtSignal()
+
     def __init__(self, parent=None):
         super(ProgressBar, self).__init__(parent)
+
+        self._allow_close = False
+        self._cancel_emitted = False
 
         self.resize(350, 100)
         self.setWindowTitle(self.tr("视频保存进度信息"))
@@ -25,7 +31,7 @@ class ProgressBar(QDialog):
         FeatLayout.addWidget(self.FeatLabel)
         FeatLayout.addWidget(self.FeatProgressBar)
 
-        self.cancelButton = QPushButton('取消保存', self)
+        self.cancelButton = QPushButton("取消保存", self)
 
         buttonlayout = QHBoxLayout()
         buttonlayout.addStretch(1)
@@ -39,9 +45,29 @@ class ProgressBar(QDialog):
         self.cancelButton.clicked.connect(self.onCancel)
         # self.show()
 
-    def setValue(self, start, end, progress):
+    def setValue(self, start, end):
         self.TipLabel.setText(self.tr("当前帧/总帧数:" + "   " + str(start) + "/" + str(end)))
-        self.FeatProgressBar.setValue(progress)
+        if end <= 0:
+            self.FeatProgressBar.setRange(0, 0)
+            return
+        self.FeatProgressBar.setRange(0, 100)
+        self.FeatProgressBar.setValue(min(100, int(start * 100 / end)))
 
-    def onCancel(self, event):
+    def onCancel(self):
+        if self._cancel_emitted:
+            return
+        self._cancel_emitted = True
+        self.cancelButton.setEnabled(False)
+        self.cancelButton.setText(self.tr("正在取消…"))
+        self.cancel_requested.emit()
+
+    def finish(self):
+        self._allow_close = True
         self.close()
+
+    def closeEvent(self, event):
+        if self._allow_close:
+            event.accept()
+            return
+        self.onCancel()
+        event.ignore()

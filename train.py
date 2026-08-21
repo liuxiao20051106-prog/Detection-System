@@ -1,14 +1,31 @@
-#coding:utf-8
+"""可复现的 YOLO 训练入口。"""
+
+import argparse
+from pathlib import Path
+
 from ultralytics import YOLO
 
-# 加载预训练模型
-model = YOLO("yolov8n.pt")
-# Use the model
-if __name__ == '__main__':
-    # Use the model
-    results = model.train(data='datasets/data.yaml', epochs=100, batch=4)  # 训练模型
-    # 将模型转为onnx格式
-    # success = model.export(format='onnx')
+
+def main():
+    parser = argparse.ArgumentParser(description="训练葡萄成熟度检测模型")
+    parser.add_argument("--data", required=True, help="YOLO 数据集 YAML")
+    parser.add_argument("--model", default="yolov8n.pt", help="预训练模型或本地权重")
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--batch", type=int, default=4)
+    parser.add_argument("--seed", type=int, default=0)
+    args = parser.parse_args()
+
+    data = Path(args.data).expanduser().resolve(strict=True)
+    if data.suffix.lower() not in {".yaml", ".yml"}:
+        raise ValueError("--data 必须是 YAML 文件")
+    YOLO(args.model).train(
+        data=str(data),
+        epochs=args.epochs,
+        batch=args.batch,
+        seed=args.seed,
+        deterministic=True,
+    )
 
 
-
+if __name__ == "__main__":
+    main()

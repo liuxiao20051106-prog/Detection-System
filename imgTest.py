@@ -1,22 +1,31 @@
-#coding:utf-8
+"""单张图片命令行检测工具。"""
+
+import argparse
+from pathlib import Path
+
 from ultralytics import YOLO
-import cv2
 
-# 所需加载的模型目录
-path = 'models/best.pt'
-# 需要检测的图片地址
-img_path = "UIProgram/ui_imgs/微信截图_20250222235847.png"
-
-# 加载预训练模型
-# conf	0.25	object confidence threshold for detection
-# iou	0.7	intersection over union (IoU) threshold for NMS
-model = YOLO(path, task='detect')
-# model = YOLO(path, task='detect',conf=0.5)
+import Config
+from detection_core import image_write, make_output_path, validate_image_file, validate_model_file
 
 
-# 检测图片
-results = model(img_path)
-res = results[0].plot()
-res = cv2.resize(res,dsize=None,fx=2,fy=2,interpolation=cv2.INTER_LINEAR)
-cv2.imshow("YOLOv8 Detection", res)
-cv2.waitKey(0)
+def main():
+    parser = argparse.ArgumentParser(description="检测单张葡萄图片")
+    parser.add_argument("image", help="待检测图片")
+    parser.add_argument("--output", default=Config.save_path, help="输出目录")
+    parser.add_argument("--conf", type=float, default=0.25)
+    parser.add_argument("--iou", type=float, default=0.45)
+    args = parser.parse_args()
+
+    image = validate_image_file(args.image)
+    model_path = validate_model_file(Config.model_path, Config.model_sha256)
+    result = YOLO(str(model_path), task="detect")(
+        image, conf=args.conf, iou=args.iou, verbose=False
+    )[0]
+    output = make_output_path(args.image, args.output)
+    image_write(output, result.plot())
+    print(Path(output))
+
+
+if __name__ == "__main__":
+    main()

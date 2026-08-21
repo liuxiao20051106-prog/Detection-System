@@ -6,8 +6,11 @@ venv/
 .idea/
 .vscode/
 .pytest_cache/
+.ruff_cache/
+.coverage
 save_data/
 runs/
 dist/
 build/
 *.egg-info/
+*.partial.avi

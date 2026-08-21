@@ -9,5 +9,7 @@
     <file>ui_imgs/icons/video.png</file>
     <file>ui_imgs/11.png</file>
   </qresource>
-  <qresource prefix="bgs"/>
+  <qresource prefix="bgs">
+    <file>ui_imgs/bg22.png</file>
+  </qresource>
 </RCC>

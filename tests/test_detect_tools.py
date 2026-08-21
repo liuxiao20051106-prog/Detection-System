@@ -14,7 +14,7 @@ class DetectToolsTests(unittest.TestCase):
 
     def test_unicode_image_write_and_read(self):
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / '葡萄检测.png'
+            path = Path(directory) / "葡萄检测.png"
             image = np.zeros((8, 8, 3), dtype=np.uint8)
             detect_tools.img_cvwrite(path, image)
             loaded = detect_tools.img_cvread(path)
@@ -23,12 +23,12 @@ class DetectToolsTests(unittest.TestCase):
     def test_list_image_files_is_filtered_and_sorted(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / 'b.PNG').touch()
-            (root / 'A.jpg').touch()
-            (root / 'notes.txt').touch()
+            (root / "b.PNG").touch()
+            (root / "A.jpg").touch()
+            (root / "notes.txt").touch()
             names = [Path(path).name for path in detect_tools.list_image_files(root)]
-            self.assertEqual(names, ['A.jpg', 'b.PNG'])
+            self.assertEqual(names, ["A.jpg", "b.PNG"])
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     unittest.main()

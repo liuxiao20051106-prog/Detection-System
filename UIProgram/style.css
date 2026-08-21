@@ -13,4 +13,4 @@ QPushButton:hover{color:red}
 QPushButton:pressed{background-color:rgb(180,180,180);border: None;}
 
 
-#MainWindow{border-image:url(UIProgram/ui_imgs/bg22.png)}
+#MainWindow{border-image:url(:/bgs/ui_imgs/bg22.png)}
