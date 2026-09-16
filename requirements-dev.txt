@@ -1,0 +1,6 @@
+# 开发与测试所需的最小依赖（不含 torch / ultralytics，CI 可秒级完成）
+numpy>=1.23.5
+opencv-python-headless>=4.8,<5
+Pillow>=9.5
+PyQt5>=5.15.9,<5.16
+flake8>=7.0

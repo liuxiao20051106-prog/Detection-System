@@ -1,12 +1,29 @@
 # -*- coding: utf-8 -*-
+"""葡萄成熟度检测系统桌面端入口。
+
+线程分工（这是本次重构最核心的一点）：
+
+- **界面线程**：取视频帧、渲染画面、写结果文件；
+- **workers.py 的后台线程**：YOLO 推理与绘框。
+
+之所以不让工作线程去碰 ``cv2.VideoCapture``：OpenCV 的视频后端（Windows 的
+MSMF / DirectShow）对“在哪个线程里初始化”很敏感，放到 QThread 里容易出现卡死
+或设备打不开；而取帧本身开销很小，留在界面线程最稳，只需要 QTimer 驱动即可。
+真正耗时的推理仍然全部在后台，所以窗口不会卡。
+"""
+
+from __future__ import annotations
+
+import logging
 import os
 import sys
+import threading
 import time
+from pathlib import Path
+from typing import Optional, Sequence
 
 import cv2
-import torch
-from PIL import ImageFont
-from PyQt5.QtCore import QCoreApplication, QThread, QTimer, Qt, pyqtSignal
+from PyQt5.QtCore import QCoreApplication, Qt, QTimer
 from PyQt5.QtWidgets import (QAbstractItemView, QApplication, QFileDialog,
                              QHeaderView, QMainWindow, QMessageBox,
                              QTableWidgetItem)
@@ -18,772 +35,714 @@ from UIProgram.QssLoader import QSSLoader
 from UIProgram.UiMain import Ui_MainWindow
 from UIProgram.precess_bar import ProgressBar
 from UIProgram import ui_sources_rc  # noqa: F401 - 注册 Qt 资源
+from workers import (ImageDetectionWorker, FrameDetectionWorker,
+                     open_video_capture)
+
+LOGGER = logging.getLogger(__name__)
+
+ALL_TARGETS = '全部'
+CAMERA_FRAME_MS = 33  # 摄像头画面约 30 FPS，与界面刷新节奏一致
 
 
 class MainWindow(QMainWindow, Ui_MainWindow):
-    def __init__(self, parent=None):
+    """主窗口：负责界面状态与信号编排，不直接做推理。"""
+
+    def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setupUi(self)
-        if hasattr(self, 'label_2'):
-            self.label_2.hide()
-        if hasattr(self, 'label_12'):
-            self.label_12.hide()
-        self.initMain()
+        for hidden_label in ('label_2', 'label_12'):
+            widget = getattr(self, hidden_label, None)
+            if widget is not None:
+                widget.hide()
+
+        self.init_state()
+        self.init_table()
+        self.init_workers()
+        self.init_ui()
         self.signalconnect()
 
-        # 加载css渲染效果
-        style_file = os.path.join(Config.PROJECT_ROOT, 'UIProgram', 'style.css')
-        qssStyleSheet = QSSLoader.read_qss_file(style_file)
-        self.setStyleSheet(qssStyleSheet)
-
-        # 设置SpinBox的范围和步长
-        self.doubleSpinBox.setRange(0.0, 1.0)  # 置信度阈值范围
-        self.doubleSpinBox.setSingleStep(0.05)  # 步长
-        self.doubleSpinBox_2.setRange(0.0, 1.0)  # IOU阈值范围
-        self.doubleSpinBox_2.setSingleStep(0.05)  # 步长
-
-        # 添加新控件的信号连接
-        self.doubleSpinBox.valueChanged.connect(self.update_conf_thres)
-        self.doubleSpinBox_2.valueChanged.connect(self.update_iou_thres)
-        self.checkBox.stateChanged.connect(self.update_show_labels)
-        
-        # 初始化参数
-        self.conf_thres = 0.25  # 默认置信度阈值
-        self.iou_thres = 0.45   # 默认IOU阈值
-        self.show_labels = True  # 默认显示标签
-        
-        # 设置SpinBox的初始值
-        self.doubleSpinBox.setValue(self.conf_thres)
-        self.doubleSpinBox_2.setValue(self.iou_thres)
-        self.checkBox.setChecked(self.show_labels)
-
-    def signalconnect(self):
-        self.PicBtn.clicked.connect(self.open_img)
-        self.comboBox.activated.connect(self.combox_change)
-        self.VideoBtn.clicked.connect(self.vedio_show)
-        self.CapBtn.clicked.connect(self.camera_show)
-        self.SaveBtn.clicked.connect(self.save_detect_video)
-        self.ExitBtn.clicked.connect(QCoreApplication.quit)
-        self.FilesBtn.clicked.connect(self.detact_batch_imgs)
-
-    def initMain(self):
-        self.show_width = 770
+    # ------------------------------------------------------------------ #
+    # 初始化
+    # ------------------------------------------------------------------ #
+    def init_state(self) -> None:
+        """初始化业务状态。"""
+        self.show_width = 770   # 与 UI 里 label_show 的显示区域保持一致
         self.show_height = 480
 
-        self.org_path = None
+        self.org_path: Optional[str] = None
+        self.org_img = None            # 最近一次检测的原图（缓存用于重绘）
+        self.draw_img = None           # 最近一次检测带框的图（用于保存）
+        self.last_result = tools.DetectionResult()
 
-        self.is_camera_open = False
-        self.cap = None
+        self.conf_thres = Config.DEFAULT_CONF_THRES
+        self.iou_thres = Config.DEFAULT_IOU_THRES
+        self.show_labels = True
 
-        self.device = 0 if torch.cuda.is_available() else 'cpu'
+        self._batch_mode = False
+        self._exporting = False        # 图片/文件夹导出任务进行中
+        self._streaming = False        # 摄像头/视频画面进行中
+        self._camera_open = False
+        self._pending_frame = None
+        self._combo_signature: Optional[tuple] = None
+        self._last_table_update = 0.0
+        self.progress_bar: Optional[ProgressBar] = None
 
         os.makedirs(Config.save_path, exist_ok=True)
         if not os.path.isfile(Config.model_path):
             raise FileNotFoundError(
-                f"未找到模型文件：{Config.model_path}\n"
-                "请将模型放入 models/best.pt，或设置 DETECTION_MODEL_PATH。"
+                f'未找到模型文件：{Config.model_path}\n'
+                '请将模型放到 models/best.pt，或设置环境变量 DETECTION_MODEL_PATH。'
             )
 
-        # 加载检测模型
+        # GPU 由 ultralytics 自动选择，因此界面进程不再依赖 torch。
         self.model = YOLO(Config.model_path, task='detect')
-        self.fontC = ImageFont.truetype(Config.font_path, 25, 0)
+        self.model_lock = threading.Lock()
 
-        # 用于绘制不同颜色矩形框
-        self.colors = tools.Colors()
+        # 视频/导出流水线：主线程取帧 -> 投给工作线程
+        self.cap = None
+        self.writer = None
+        self.export_path = ''
+        self.export_total = 0
+        self.export_current = 0
 
-        # 更新视频图像
-        self.timer_camera = QTimer()
-        self.timer_camera.timeout.connect(self.open_frame)
+        # 帧渲染节流：高帧率时用定时器抽帧显示，中间帧自动丢弃。
+        self.frame_timer = QTimer(self)
+        self.frame_timer.setInterval(Config.FRAME_RENDER_INTERVAL_MS)
+        self.frame_timer.timeout.connect(self.flush_pending_frame)
 
-        # 更新检测信息表格
-        # self.timer_info = QTimer()
-        # 保存视频
-        self.timer_save_video = QTimer()
+        # 视频取帧节拍
+        self.capture_timer = QTimer(self)
+        self.capture_timer.timeout.connect(self.capture_tick)
 
-        # 表格
+        # 导出收尾轮询：视频帧取完后要等工作线程把队列排空
+        self.drain_timer = QTimer(self)
+        self.drain_timer.setInterval(100)
+        self.drain_timer.timeout.connect(self.check_export_finished)
+
+        # 阈值连续拖动时去抖，避免每一格都触发一次推理
+        self.redetect_timer = QTimer(self)
+        self.redetect_timer.setSingleShot(True)
+        self.redetect_timer.setInterval(Config.REDETECT_DEBOUNCE_MS)
+        self.redetect_timer.timeout.connect(self.redetect_current_image)
+
+    def init_table(self) -> None:
         self.tableWidget.verticalHeader().setSectionResizeMode(QHeaderView.Fixed)
         self.tableWidget.verticalHeader().setDefaultSectionSize(40)
-        self.tableWidget.setColumnWidth(0, 80)  # 设置列宽
-        self.tableWidget.setColumnWidth(1, 200)
-        self.tableWidget.setColumnWidth(2, 150)
-        self.tableWidget.setColumnWidth(3, 90)
-        self.tableWidget.setColumnWidth(4, 230)
-        # self.tableWidget.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)  # 表格铺满
-        # self.tableWidget.horizontalHeader().setSectionResizeMode(0, QHeaderView.Interactive)
-        # self.tableWidget.setEditTriggers(QAbstractItemView.NoEditTriggers)  # 设置表格不可编辑
-        self.tableWidget.setSelectionBehavior(QAbstractItemView.SelectRows)  # 设置表格整行选中
-        self.tableWidget.verticalHeader().setVisible(False)  # 隐藏列标题
-        self.tableWidget.setAlternatingRowColors(True)  # 表格背景交替
+        for column, width in enumerate((80, 200, 150, 90, 230)):
+            self.tableWidget.setColumnWidth(column, width)
+        self.tableWidget.verticalHeader().setVisible(False)
+        self.tableWidget.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.tableWidget.setAlternatingRowColors(True)
 
-        # 设置主页背景图片border-image: url(:/icons/ui_imgs/icons/camera.png)
-        # self.setStyleSheet("#MainWindow{background-image:url(:/bgs/ui_imgs/bg3.jpg)}")
+    def init_workers(self) -> None:
+        """所有推理线程集中创建并连接信号，界面只消费结果。"""
+        self.image_worker = ImageDetectionWorker(self.model, self.model_lock, self)
+        self.image_worker.image_done.connect(self.on_image_detected)
+        self.image_worker.progress.connect(self.on_progress)
+        self.image_worker.finished_all.connect(self.on_image_task_finished)
+        self.image_worker.failed.connect(self.on_worker_failed)
 
-    def open_img(self):
-        if self.cap:
-            # 打开图片前关闭摄像头
-            self.video_stop()
-            self.is_camera_open = False
-            self.CaplineEdit.setText('摄像头未开启')
-            self.cap = None
+        self.frame_worker = FrameDetectionWorker(self.model, self.model_lock, self)
+        self.frame_worker.frame_done.connect(self.on_frame_result)
+        self.frame_worker.failed.connect(self.on_worker_failed)
 
-        # 弹出的窗口名称：'打开图片'
-        # 默认打开的目录：'./'
-        # 只能打开.jpg与.gif结尾的图片文件
-        # file_path, _ = QFileDialog.getOpenFileName(self.centralwidget, '打开图片', './', "Image files (*.jpg *.gif)")
-        file_path, _ = QFileDialog.getOpenFileName(None, '打开图片', './', "Image files (*.jpg *.jpeg *.png *.bmp)")
-        if not file_path:
+    def init_ui(self) -> None:
+        """样式、阈值控件初始状态。"""
+        style_file = os.path.join(str(Config.PROJECT_ROOT), 'UIProgram', 'style.css')
+        self.setStyleSheet(QSSLoader.read_qss_file(style_file))
+
+        for box, default in ((self.doubleSpinBox, self.conf_thres), (self.doubleSpinBox_2, self.iou_thres)):
+            box.setRange(0.0, 1.0)
+            box.setSingleStep(Config.THRES_STEP)
+            box.setValue(default)
+        self.checkBox.setChecked(self.show_labels)
+
+    def signalconnect(self) -> None:
+        self.PicBtn.clicked.connect(self.open_img)
+        self.FilesBtn.clicked.connect(self.detect_batch_imgs)
+        self.VideoBtn.clicked.connect(self.vedio_show)
+        self.CapBtn.clicked.connect(self.camera_show)
+        self.SaveBtn.clicked.connect(self.save_result)
+        self.ExitBtn.clicked.connect(QCoreApplication.quit)
+        self.comboBox.activated.connect(self.combox_change)
+
+        self.doubleSpinBox.valueChanged.connect(self.update_conf_thres)
+        self.doubleSpinBox_2.valueChanged.connect(self.update_iou_thres)
+        self.checkBox.stateChanged.connect(self.update_show_labels)
+
+    # ------------------------------------------------------------------ #
+    # 图片 / 文件夹检测
+    # ------------------------------------------------------------------ #
+    def open_img(self) -> None:
+        """选择单张图片并检测。"""
+        self.stop_stream()
+        path, _ = QFileDialog.getOpenFileName(self, '打开图片', str(Config.PROJECT_ROOT), Config.IMAGE_FILTER)
+        if not path:
             return
+        self.prepare_single_source(path)
+        self.detect_images([path], batch=False)
 
-        self.comboBox.setDisabled(False)
-        self.org_path = file_path
-        self.org_img = tools.img_cvread(self.org_path)
-
-        # 目标检测
-        t1 = time.time()
-        self.results = self.model(self.org_path, conf=self.conf_thres, iou=self.iou_thres)[0]
-        t2 = time.time()
-        take_time_str = '{:.3f} s'.format(t2 - t1)
-        self.time_lb.setText(take_time_str)
-
-        location_list = self.results.boxes.xyxy.tolist()
-        self.location_list = [list(map(int, e)) for e in location_list]
-        cls_list = self.results.boxes.cls.tolist()
-        self.cls_list = [int(i) for i in cls_list]
-        self.conf_list = self.results.boxes.conf.tolist()
-        self.conf_list = ['%.2f %%' % (each*100) for each in self.conf_list]
-
-        # now_img = self.cv_img.copy()
-        # for loacation, type_id, conf in zip(self.location_list, self.cls_list, self.conf_list):
-        #     type_id = int(type_id)
-        #     color = self.colors(int(type_id), True)
-        #     # cv2.rectangle(now_img, (int(x1), int(y1)), (int(x2), int(y2)), colors(int(type_id), True), 3)
-        #     now_img = tools.drawRectBox(now_img, loacation, Config.CH_names[type_id], self.fontC, color)
-        now_img = self.results.plot()
-        self.draw_img = now_img
-        # 获取缩放后的图片尺寸
-        self.img_width, self.img_height = self.get_resize_size(now_img)
-        resize_cvimg = cv2.resize(now_img,(self.img_width, self.img_height))
-        pix_img = tools.cvimg_to_qpiximg(resize_cvimg)
-        self.label_show.setPixmap(pix_img)
-        self.label_show.setAlignment(Qt.AlignCenter)
-        # 设置路径显示
-        self.PiclineEdit.setText(self.org_path)
-
-        # 目标数目
-        target_nums = len(self.cls_list)
-        self.label_nums.setText(str(target_nums))
-
-        # 设置目标选择下拉框
-        choose_list = ['全部']
-        target_names = [Config.names[id]+ '_'+ str(index) for index,id in enumerate(self.cls_list)]
-        # object_list = sorted(set(self.cls_list))
-        # for each in object_list:
-        #     choose_list.append(Config.CH_names[each])
-        choose_list = choose_list + target_names
-
-        self.comboBox.clear()
-        self.comboBox.addItems(choose_list)
-
-        if target_nums >= 1:
-            self.type_lb.setText(Config.CH_names[self.cls_list[0]])
-            self.label_conf.setText(str(self.conf_list[0]))
-        #   默认显示第一个目标框坐标
-        #   设置坐标位置值
-            self.label_xmin.setText(str(self.location_list[0][0]))
-            self.label_ymin.setText(str(self.location_list[0][1]))
-            self.label_xmax.setText(str(self.location_list[0][2]))
-            self.label_ymax.setText(str(self.location_list[0][3]))
-        else:
-            self.type_lb.setText('')
-            self.label_conf.setText('')
-            self.label_xmin.setText('')
-            self.label_ymin.setText('')
-            self.label_xmax.setText('')
-            self.label_ymax.setText('')
-
-        # # 删除表格所有行
-        self.tableWidget.setRowCount(0)
-        self.tableWidget.clearContents()
-        self.tabel_info_show(self.location_list, self.cls_list, self.conf_list,path=self.org_path)
-
-
-    def detact_batch_imgs(self):
-        if self.cap:
-            # 打开图片前关闭摄像头
-            self.video_stop()
-            self.is_camera_open = False
-            self.CaplineEdit.setText('摄像头未开启')
-            self.cap = None
-        directory = QFileDialog.getExistingDirectory(self,
-                                                      "选取文件夹",
-                                                      "./")  # 起始路径
-        if not  directory:
+    def detect_batch_imgs(self) -> None:
+        """选择文件夹批量检测。"""
+        self.stop_stream()
+        directory = QFileDialog.getExistingDirectory(self, '选取文件夹', str(Config.PROJECT_ROOT))
+        if not directory:
             return
-        self.org_path = directory
-        image_files = tools.list_image_files(directory)
-        if not image_files:
+        images = tools.list_image_files(directory)
+        if not images:
             QMessageBox.information(self, '提示', '所选文件夹中没有支持的图片。')
             return
-        for full_path in image_files:
-                # self.comboBox.setDisabled(False)
-                img_path = full_path
-                self.org_img = tools.img_cvread(img_path)
-                # 目标检测
-                t1 = time.time()
-                self.results = self.model(img_path,conf=self.conf_thres, iou=self.iou_thres)[0]
-                t2 = time.time()
-                take_time_str = '{:.3f} s'.format(t2 - t1)
-                self.time_lb.setText(take_time_str)
 
-                location_list = self.results.boxes.xyxy.tolist()
-                self.location_list = [list(map(int, e)) for e in location_list]
-                cls_list = self.results.boxes.cls.tolist()
-                self.cls_list = [int(i) for i in cls_list]
-                self.conf_list = self.results.boxes.conf.tolist()
-                self.conf_list = ['%.2f %%' % (each * 100) for each in self.conf_list]
+        self.org_path = directory
+        self._batch_mode = True
+        self.reset_table()
+        self.PiclineEdit.setText(directory)
+        LOGGER.info('开始批量检测：%s 张图片', len(images))
+        self.run_image_worker(images, batch=True, persist=False)
 
-                now_img = self.results.plot()
+    def prepare_single_source(self, path: str) -> None:
+        """切到单张图片模式前重置相关状态。"""
+        self._batch_mode = False
+        self.org_path = path
+        self.PiclineEdit.setText(path)
+        self.reset_table()
+        self._combo_signature = None
+        self.comboBox.setDisabled(False)
 
-                self.draw_img = now_img
-                # 获取缩放后的图片尺寸
-                self.img_width, self.img_height = self.get_resize_size(now_img)
-                resize_cvimg = cv2.resize(now_img, (self.img_width, self.img_height))
-                pix_img = tools.cvimg_to_qpiximg(resize_cvimg)
-                self.label_show.setPixmap(pix_img)
-                self.label_show.setAlignment(Qt.AlignCenter)
-                # 设置路径显示
-                self.PiclineEdit.setText(img_path)
-
-                # 目标数目
-                target_nums = len(self.cls_list)
-                self.label_nums.setText(str(target_nums))
-
-                # 设置目标选择下拉框
-                choose_list = ['全部']
-                target_names = [Config.names[id] + '_' + str(index) for index, id in enumerate(self.cls_list)]
-                choose_list = choose_list + target_names
-
-                self.comboBox.clear()
-                self.comboBox.addItems(choose_list)
-
-                if target_nums >= 1:
-                    self.type_lb.setText(Config.CH_names[self.cls_list[0]])
-                    self.label_conf.setText(str(self.conf_list[0]))
-                    #   默认显示第一个目标框坐标
-                    #   设置坐标位置值
-                    self.label_xmin.setText(str(self.location_list[0][0]))
-                    self.label_ymin.setText(str(self.location_list[0][1]))
-                    self.label_xmax.setText(str(self.location_list[0][2]))
-                    self.label_ymax.setText(str(self.location_list[0][3]))
-                else:
-                    self.type_lb.setText('')
-                    self.label_conf.setText('')
-                    self.label_xmin.setText('')
-                    self.label_ymin.setText('')
-                    self.label_xmax.setText('')
-                    self.label_ymax.setText('')
-
-                # # 删除表格所有行
-                # self.tableWidget.setRowCount(0)
-                # self.tableWidget.clearContents()
-                self.tabel_info_show(self.location_list, self.cls_list, self.conf_list, path=img_path)
-                self.tableWidget.scrollToBottom()
-                QApplication.processEvents()  #刷新页面
-
-    def draw_rect_and_tabel(self, results, img):
-        now_img = img.copy()
-        location_list = results.boxes.xyxy.tolist()
-        self.location_list = [list(map(int, e)) for e in location_list]
-        cls_list = results.boxes.cls.tolist()
-        self.cls_list = [int(i) for i in cls_list]
-        self.conf_list = results.boxes.conf.tolist()
-        self.conf_list = ['%.2f %%' % (each * 100) for each in self.conf_list]
-
-        for loacation, type_id, conf in zip(self.location_list, self.cls_list, self.conf_list):
-            type_id = int(type_id)
-            color = self.colors(int(type_id), True)
-            # cv2.rectangle(now_img, (int(x1), int(y1)), (int(x2), int(y2)), colors(int(type_id), True), 3)
-            now_img = tools.drawRectBox(now_img, loacation, Config.CH_names[type_id], self.fontC, color)
-
-        # 获取缩放后的图片尺寸
-        self.img_width, self.img_height = self.get_resize_size(now_img)
-        resize_cvimg = cv2.resize(now_img, (self.img_width, self.img_height))
-        pix_img = tools.cvimg_to_qpiximg(resize_cvimg)
-        self.label_show.setPixmap(pix_img)
-        self.label_show.setAlignment(Qt.AlignCenter)
-        # 设置路径显示
-        self.PiclineEdit.setText(self.org_path)
-
-        # 目标数目
-        target_nums = len(self.cls_list)
-        self.label_nums.setText(str(target_nums))
-        if target_nums >= 1:
-            self.type_lb.setText(Config.CH_names[self.cls_list[0]])
-            self.label_conf.setText(str(self.conf_list[0]))
-            self.label_xmin.setText(str(self.location_list[0][0]))
-            self.label_ymin.setText(str(self.location_list[0][1]))
-            self.label_xmax.setText(str(self.location_list[0][2]))
-            self.label_ymax.setText(str(self.location_list[0][3]))
-        else:
-            self.type_lb.setText('')
-            self.label_conf.setText('')
-            self.label_xmin.setText('')
-            self.label_ymin.setText('')
-            self.label_xmax.setText('')
-            self.label_ymax.setText('')
-
-        # 删除表格所有行
-        self.tableWidget.setRowCount(0)
-        self.tableWidget.clearContents()
-        self.tabel_info_show(self.location_list, self.cls_list, self.conf_list, path=self.org_path)
-        return now_img
-
-    def combox_change(self):
-        if not getattr(self, 'location_list', None):
+    def run_image_worker(self, paths: Sequence[str], batch: bool, persist: bool) -> None:
+        """启动图片检测线程；同时只允许一个任务在跑。"""
+        if self.image_worker.isRunning():
+            QMessageBox.information(self, '提示', '正在处理上一次任务，请稍候。')
             return
-        com_text = self.comboBox.currentText()
-        if not com_text:
+        self._batch_mode = batch
+        self._exporting = persist
+        if persist or len(paths) > 5:
+            self.show_progress(self.image_worker)
+        self.image_worker.configure(
+            [str(path) for path in paths],
+            self.conf_thres,
+            self.iou_thres,
+            self.show_labels,
+            persist=persist,
+        )
+        self.image_worker.start()
+
+    def detect_images(self, paths: Sequence[str], batch: bool) -> None:
+        self.run_image_worker(paths, batch=batch, persist=False)
+
+    def on_image_detected(self, detection, frame, annotated, index: int, total: int) -> None:
+        """图片/批量模式的结果回调（后台线程 -> 界面线程）。"""
+        if self._exporting:  # 导出任务只更新进度，不刷新画面
             return
-        if com_text == '全部':
-            cur_box = self.location_list
-            cur_img = self.results.plot()
-            self.type_lb.setText(Config.CH_names[self.cls_list[0]])
-            self.label_conf.setText(str(self.conf_list[0]))
+
+        self.last_result = detection
+        self.org_img = frame
+        self.draw_img = annotated
+        self.org_path = detection.source
+
+        if not self._batch_mode:
+            self.reset_table()
+            self.PiclineEdit.setText(detection.source)
+
+        self.show_inference_time(detection)
+        self.label_nums.setText(str(len(detection)))
+        self.update_target_panel(detection, 0)
+        self.update_combo_box(detection)
+        self.queue_frame(frame, annotated, detection)
+        self.append_table(detection, replace=not self._batch_mode)
+
+    def on_image_task_finished(self, save_dir: str) -> None:
+        """图片/批量任务收尾：关进度条，导出任务再弹提示。"""
+        exporting = self._exporting
+        self._exporting = False
+        self.close_progress()
+        if exporting:
+            QMessageBox.about(self, '提示', f'图片保存成功！\n文件路径：{save_dir}')
+
+    # ------------------------------------------------------------------ #
+    # 视频 / 摄像头：主线程取帧，工作线程推理
+    # ------------------------------------------------------------------ #
+    def vedio_show(self) -> None:
+        """打开视频文件并逐帧检测。"""
+        self.stop_stream()
+        path, _ = QFileDialog.getOpenFileName(self, '打开视频', str(Config.PROJECT_ROOT), Config.VIDEO_FILTER)
+        if not path:
+            return
+        self.org_path = path
+        self.VideolineEdit.setText(path)
+        self.start_stream(path)
+
+    def camera_show(self) -> None:
+        """开关摄像头。"""
+        if self._camera_open:
+            self._camera_open = False
+            self.CaplineEdit.setText('摄像头未开启')
+            self.stop_stream()
+            self.label_show.clear()
+            self.label_show.setText('')
+            return
+
+        self.stop_stream()
+        if self.start_stream(0):
+            self._camera_open = True
+            self.CaplineEdit.setText('摄像头开启')
         else:
-            index = int(com_text.split('_')[-1])
-            cur_box = [self.location_list[index]]
-            cur_img = self.results[index].plot()
-            self.type_lb.setText(Config.CH_names[self.cls_list[index]])
-            self.label_conf.setText(str(self.conf_list[index]))
+            self.CaplineEdit.setText('摄像头未开启')
 
-        # 设置坐标位置值
-        self.label_xmin.setText(str(cur_box[0][0]))
-        self.label_ymin.setText(str(cur_box[0][1]))
-        self.label_xmax.setText(str(cur_box[0][2]))
-        self.label_ymax.setText(str(cur_box[0][3]))
+    def start_stream(self, source) -> bool:
+        """启动实时画面；返回是否成功打开视频源。"""
+        cap = open_video_capture(source)
+        if cap is None:
+            QMessageBox.warning(self, '打开失败', f'无法打开视频源：{source}\n请检查文件是否损坏或设备是否被占用。')
+            return False
 
-        resize_cvimg = cv2.resize(cur_img, (self.img_width, self.img_height))
-        pix_img = tools.cvimg_to_qpiximg(resize_cvimg)
-        self.label_show.clear()
-        self.label_show.setPixmap(pix_img)
-        self.label_show.setAlignment(Qt.AlignCenter)
+        self.cap = cap
+        self.org_path = str(source)
+        self.org_img = None
+        self._combo_signature = None
+        self._exporting = False
+        self._streaming = True
+        self.reset_table()
+        self.comboBox.setDisabled(True)
+        self.frame_worker.configure(self.conf_thres, self.iou_thres, self.show_labels)
+        self.frame_worker.start()
+        self.capture_timer.start(self.frame_interval(source))
+        return True
 
+    def frame_interval(self, source) -> int:
+        """按视频自身帧率取帧；摄像头统一按 30 FPS。"""
+        if isinstance(source, int) or (isinstance(source, str) and source.isdigit()):
+            return CAMERA_FRAME_MS
+        fps = self.cap.get(cv2.CAP_PROP_FPS) if self.cap is not None else 0
+        if fps and 0 < fps <= 120:
+            return max(5, int(1000 / fps))
+        return CAMERA_FRAME_MS
 
-    def get_video_path(self):
-        file_path, _ = QFileDialog.getOpenFileName(None, '打开视频', './', "Image files (*.avi *.mp4 *.wmv *.mkv)")
-        if not file_path:
-            return None
-        self.org_path = file_path
-        self.VideolineEdit.setText(file_path)
-        return file_path
+    def capture_tick(self) -> None:
+        """取一帧交给工作线程；队列满时本帧丢弃，下一拍继续。"""
+        if self.cap is None or not self.cap.isOpened():
+            self.finish_stream()
+            return
+        ok, frame = self.cap.read()
+        if not ok:
+            self.finish_stream()
+            return
+        self.frame_worker.submit(frame)
 
-    def video_start(self):
-        # 删除表格所有行
-        self.tableWidget.setRowCount(0)
-        self.tableWidget.clearContents()
+    def on_frame_result(self, detection, annotated, frame) -> None:
+        """实时/导出模式下每帧结果的回调。"""
+        self.last_result = detection
+        self.draw_img = annotated
+        self.org_img = frame
 
-        # 清空下拉框
-        self.comboBox.clear()
+        if self._exporting:
+            self.write_export_frame(annotated)
+            return
 
-        # 定时器开启，每隔一段时间，读取一帧
-        self.timer_camera.start(1)
+        self.show_inference_time(detection)
+        self.label_nums.setText(str(len(detection)))
+        self.update_target_panel(detection, 0)
+        self.update_combo_box(detection)
+        self.queue_frame(frame, annotated, detection)
 
-    def tabel_info_show(self, locations, clses, confs, path=None):
-        path = path
-        for location, cls, conf in zip(locations, clses, confs):
-            row_count = self.tableWidget.rowCount()  # 返回当前行数(尾部)
-            self.tableWidget.insertRow(row_count)  # 尾部插入一行
-            item_id = QTableWidgetItem(str(row_count+1))  # 序号
-            item_id.setTextAlignment(Qt.AlignHCenter | Qt.AlignVCenter)  # 设置文本居中
-            item_path = QTableWidgetItem(str(path))  # 路径
-            # item_path.setTextAlignment(Qt.AlignHCenter | Qt.AlignVCenter)
+    def finish_stream(self) -> None:
+        """视频取完最后一帧。"""
+        self.capture_timer.stop()
+        if self._exporting:
+            self.frame_worker.stop()  # 停止投递，等待队列排空
+            self.drain_timer.start()
+            return
+        self.stop_stream()
 
-            item_cls = QTableWidgetItem(str(Config.CH_names[cls]))
-            item_cls.setTextAlignment(Qt.AlignHCenter | Qt.AlignVCenter)  # 设置文本居中
-
-            item_conf = QTableWidgetItem(str(conf))
-            item_conf.setTextAlignment(Qt.AlignHCenter | Qt.AlignVCenter)  # 设置文本居中
-
-            item_location = QTableWidgetItem(str(location)) # 目标框位置
-            # item_location.setTextAlignment(Qt.AlignHCenter | Qt.AlignVCenter)  # 设置文本居中
-
-            self.tableWidget.setItem(row_count, 0, item_id)
-            self.tableWidget.setItem(row_count, 1, item_path)
-            self.tableWidget.setItem(row_count, 2, item_cls)
-            self.tableWidget.setItem(row_count, 3, item_conf)
-            self.tableWidget.setItem(row_count, 4, item_location)
-        self.tableWidget.scrollToBottom()
-
-    def video_stop(self):
-        self.timer_camera.stop()
+    def stop_stream(self) -> None:
+        """停止实时画面并释放采集/写盘资源。"""
+        self.capture_timer.stop()
+        self.drain_timer.stop()
         if self.cap is not None:
             self.cap.release()
-        self.cap = None
-        # self.timer_info.stop()
-
-    def open_frame(self):
-        ret, now_img = self.cap.read()
-        if ret:
-            # 目标检测
-            t1 = time.time()
-            results = self.model(now_img,conf=self.conf_thres, iou=self.iou_thres)[0]
-            t2 = time.time()
-            take_time_str = '{:.3f} s'.format(t2 - t1)
-            self.time_lb.setText(take_time_str)
-
-            location_list = results.boxes.xyxy.tolist()
-            self.location_list = [list(map(int, e)) for e in location_list]
-            cls_list = results.boxes.cls.tolist()
-            self.cls_list = [int(i) for i in cls_list]
-            self.conf_list = results.boxes.conf.tolist()
-            self.conf_list = ['%.2f %%' % (each * 100) for each in self.conf_list]
-
-            now_img = results.plot()
-
-            # 获取缩放后的图片尺寸
-            self.img_width, self.img_height = self.get_resize_size(now_img)
-            resize_cvimg = cv2.resize(now_img, (self.img_width, self.img_height))
-            pix_img = tools.cvimg_to_qpiximg(resize_cvimg)
-            self.label_show.setPixmap(pix_img)
-            self.label_show.setAlignment(Qt.AlignCenter)
-
-            # 目标数目
-            target_nums = len(self.cls_list)
-            self.label_nums.setText(str(target_nums))
-
-            # 设置目标选择下拉框
-            choose_list = ['全部']
-            target_names = [Config.names[id] + '_' + str(index) for index, id in enumerate(self.cls_list)]
-            # object_list = sorted(set(self.cls_list))
-            # for each in object_list:
-            #     choose_list.append(Config.CH_names[each])
-            choose_list = choose_list + target_names
-
-            self.comboBox.clear()
-            self.comboBox.addItems(choose_list)
-
-            if target_nums >= 1:
-                self.type_lb.setText(Config.CH_names[self.cls_list[0]])
-                self.label_conf.setText(str(self.conf_list[0]))
-                #   默认显示第一个目标框坐标
-                #   设置坐标位置值
-                self.label_xmin.setText(str(self.location_list[0][0]))
-                self.label_ymin.setText(str(self.location_list[0][1]))
-                self.label_xmax.setText(str(self.location_list[0][2]))
-                self.label_ymax.setText(str(self.location_list[0][3]))
-            else:
-                self.type_lb.setText('')
-                self.label_conf.setText('')
-                self.label_xmin.setText('')
-                self.label_ymin.setText('')
-                self.label_xmax.setText('')
-                self.label_ymax.setText('')
-
-
-            # 删除表格所有行
-            # self.tableWidget.setRowCount(0)
-            # self.tableWidget.clearContents()
-            self.tabel_info_show(self.location_list, self.cls_list, self.conf_list, path=self.org_path)
-
-        else:
-            self.video_stop()
-
-    def vedio_show(self):
-        if self.is_camera_open:
-            self.is_camera_open = False
-            self.CaplineEdit.setText('摄像头未开启')
-
-        video_path = self.get_video_path()
-        if not video_path:
-            return None
-        self.cap = cv2.VideoCapture(video_path)
-        if not self.cap.isOpened():
-            self.cap.release()
             self.cap = None
-            QMessageBox.warning(self, '打开失败', '无法打开所选视频，请检查文件是否损坏或编码是否受支持。')
+        if self.frame_worker.isRunning():
+            self.frame_worker.stop()
+            self.frame_worker.wait(3000)
+        self.release_writer()
+
+        self._streaming = False
+        self._camera_open = False
+        self._pending_frame = None
+        self._combo_signature = None
+        self.frame_timer.stop()
+        self.comboBox.setDisabled(False)
+
+    # ------------------------------------------------------------------ #
+    # 画面渲染
+    # ------------------------------------------------------------------ #
+    def queue_frame(self, frame, annotated, detection) -> None:
+        """登记待渲染帧，真正绘制在定时器里按 30 FPS 节流完成。"""
+        self._pending_frame = (annotated, detection, frame)
+        if not self.frame_timer.isActive():
+            self.frame_timer.start()
+
+    def flush_pending_frame(self) -> None:
+        if self._pending_frame is None:
+            self.frame_timer.stop()
             return
-        self.video_start()
-        self.comboBox.setDisabled(True)
+        annotated, detection, frame = self._pending_frame
+        self._pending_frame = None
+        self.render_image(annotated)
 
-    def camera_show(self):
-        self.is_camera_open = not self.is_camera_open
-        if self.is_camera_open:
-            self.CaplineEdit.setText('摄像头开启')
-            self.cap = cv2.VideoCapture(0)
-            if not self.cap.isOpened():
-                self.cap.release()
-                self.cap = None
-                self.is_camera_open = False
-                self.CaplineEdit.setText('摄像头未开启')
-                QMessageBox.warning(self, '打开失败', '无法打开摄像头，请检查设备连接和占用情况。')
+        if self._streaming:
+            now = time.monotonic()
+            if now - self._last_table_update >= Config.STREAM_TABLE_INTERVAL_MS / 1000:
+                self._last_table_update = now
+                self.append_table(detection, replace=True)
+        self.frame_timer.stop()
+
+    def render_image(self, image) -> None:
+        self.label_show.setPixmap(tools.cvimg_to_qpiximg(tools.resize_to_fit(image, self.show_width, self.show_height)))
+        self.label_show.setAlignment(Qt.AlignCenter)
+
+    def show_inference_time(self, detection: tools.DetectionResult) -> None:
+        duration = detection.duration
+        self.time_lb.setText(f'{duration * 1000:.0f} ms' if duration < 1 else f'{duration:.3f} s')
+
+    # ------------------------------------------------------------------ #
+    # 结果面板
+    # ------------------------------------------------------------------ #
+    def update_target_panel(self, detection: tools.DetectionResult, index: Optional[int]) -> None:
+        """刷新右侧类别、置信度和坐标；index 为 None 表示清空。"""
+        if index is None or len(detection) == 0:
+            self.type_lb.setText('')
+            self.label_conf.setText('')
+            for label in (self.label_xmin, self.label_ymin, self.label_xmax, self.label_ymax):
+                label.setText('')
+            return
+        index = max(0, min(index, len(detection) - 1))
+        x1, y1, x2, y2 = detection.boxes[index]
+        self.type_lb.setText(detection.label(index))
+        self.label_conf.setText(detection.conf_text(index))
+        self.label_xmin.setText(str(x1))
+        self.label_ymin.setText(str(y1))
+        self.label_xmax.setText(str(x2))
+        self.label_ymax.setText(str(y2))
+
+    def update_combo_box(self, detection: tools.DetectionResult) -> None:
+        """仅在目标构成变化时重建下拉框（每帧重建会明显掉帧）。"""
+        signature = tuple(detection.classes)
+        if signature == self._combo_signature:
+            return
+        self._combo_signature = signature
+
+        self.comboBox.blockSignals(True)
+        self.comboBox.clear()
+        self.comboBox.addItems([ALL_TARGETS] + detection.option_texts())
+        self.comboBox.setCurrentIndex(0)
+        self.comboBox.blockSignals(False)
+
+    def combox_change(self) -> None:
+        """切换“全部 / 单个目标”时重绘画面。"""
+        if self.org_img is None or len(self.last_result) == 0:
+            return
+        text = self.comboBox.currentText()
+        target_index = 0
+        indices = None
+        if text and text != ALL_TARGETS:
+            try:
+                target_index = int(text.rsplit('_', 1)[-1])
+            except ValueError:
                 return
-            self.video_start()
-            self.comboBox.setDisabled(True)
-        else:
-            self.CaplineEdit.setText('摄像头未开启')
-            self.label_show.setText('')
-            if self.cap:
-                self.cap.release()
-                cv2.destroyAllWindows()
-            self.label_show.clear()
+            if not 0 <= target_index < len(self.last_result.boxes):
+                return
+            indices = [target_index]
 
-    def get_resize_size(self, img):
-        _img = img.copy()
-        img_height, img_width , depth= _img.shape
-        ratio = img_width / img_height
-        if ratio >= self.show_width / self.show_height:
-            self.img_width = self.show_width
-            self.img_height = int(self.img_width / ratio)
-        else:
-            self.img_height = self.show_height
-            self.img_width = int(self.img_height * ratio)
-        return self.img_width, self.img_height
+        self.draw_img = tools.annotate_image(
+            self.org_img,
+            self.last_result.boxes,
+            self.last_result.classes,
+            self.last_result.confs,
+            show_labels=self.show_labels,
+            indices=indices,
+        )
+        self.render_image(self.draw_img)
+        self.update_target_panel(self.last_result, target_index)
 
-    def save_detect_video(self):
-        if self.cap is None and not self.org_path:
+    # ------------------------------------------------------------------ #
+    # 表格
+    # ------------------------------------------------------------------ #
+    def reset_table(self) -> None:
+        self.tableWidget.setRowCount(0)
+        self.tableWidget.clearContents()
+
+    def append_table(self, detection: tools.DetectionResult, replace: bool = False) -> None:
+        """写入结果行；replace=True 时先清空旧行。"""
+        if replace:
+            self.reset_table()
+        count = len(detection)
+        if count == 0:
+            return
+
+        start = self.tableWidget.rowCount()
+        self.tableWidget.setRowCount(start + count)
+        for offset in range(count):
+            self.set_table_row(start + offset, start + offset + 1, detection, offset)
+        self.trim_table()
+        self.tableWidget.scrollToBottom()
+
+    def set_table_row(self, row: int, serial: int, detection: tools.DetectionResult, index: int) -> None:
+        values = (
+            str(serial),
+            detection.source,
+            detection.label(index),
+            detection.conf_text(index),
+            str(detection.boxes[index]),
+        )
+        for column, value in enumerate(values):
+            item = QTableWidgetItem(value)
+            if column in (0, 2, 3):
+                item.setTextAlignment(Qt.AlignCenter)
+            self.tableWidget.setItem(row, column, item)
+
+    def trim_table(self) -> None:
+        for _ in range(max(0, self.tableWidget.rowCount() - Config.MAX_TABLE_ROWS)):
+            self.tableWidget.removeRow(0)
+
+    # ------------------------------------------------------------------ #
+    # 保存 / 导出
+    # ------------------------------------------------------------------ #
+    def save_result(self) -> None:
+        """根据当前数据源导出图片、文件夹结果或视频。"""
+        if self.image_worker.isRunning() or self._exporting:
+            QMessageBox.information(self, '提示', '正在处理上一次任务，请稍候。')
+            return
+        if self._camera_open:
+            QMessageBox.about(self, '提示', '摄像头视频无法保存！')
+            return
+
+        source = self.org_path
+        if not source:
             QMessageBox.about(self, '提示', '当前没有可保存信息，请先打开图片或视频！')
             return
 
-        if self.is_camera_open:
-            QMessageBox.about(self, '提示', '摄像头视频无法保存!')
-            return
-
-        if self.cap:
-            res = QMessageBox.information(self, '提示', '保存视频检测结果可能需要较长时间，请确认是否继续保存？',QMessageBox.Yes | QMessageBox.No ,  QMessageBox.Yes)
-            if res == QMessageBox.Yes:
-                self.video_stop()
-                com_text = self.comboBox.currentText()
-                self.btn2Thread_object = btn2Thread(self.org_path, self.model, com_text,self.conf_thres,self.iou_thres)
-                self.btn2Thread_object.update_ui_signal.connect(self.update_process_bar)
-                self.btn2Thread_object.completed_signal.connect(self.video_save_completed)
-                self.btn2Thread_object.error_signal.connect(self.video_save_failed)
-                self.btn2Thread_object.start()
+        if os.path.isdir(source):
+            self.export_batch_images(source)
+        elif os.path.isfile(source):
+            if source.lower().endswith(tuple(Config.VIDEO_EXTENSIONS)):
+                self.export_video(source)
             else:
-                return
+                self.export_single_image(source)
         else:
-            if os.path.isfile(self.org_path):
-                fileName = os.path.basename(self.org_path)
-                name , end_name= fileName.rsplit(".",1)
-                save_name = name + '_detect_result.' + end_name
-                save_img_path = os.path.join(Config.save_path, save_name)
-                # 保存图片
-                tools.img_cvwrite(save_img_path, self.draw_img)
-                QMessageBox.about(self, '提示', '图片保存成功!\n文件路径:{}'.format(save_img_path))
-            else:
-                for full_path in tools.list_image_files(self.org_path):
-                    file_name = os.path.basename(full_path)
-                    name, end_name = file_name.rsplit(".",1)
-                    save_name = name + '_detect_result.' + end_name
-                    save_img_path = os.path.join(Config.save_path, save_name)
-                    results = self.model(full_path,conf=self.conf_thres, iou=self.iou_thres)[0]
-                    now_img = results.plot()
-                    # 保存图片
-                    tools.img_cvwrite(save_img_path, now_img)
+            QMessageBox.about(self, '提示', '请先打开有效的图片、视频或文件夹。')
 
-                QMessageBox.about(self, '提示', '图片保存成功!\n文件路径:{}'.format(Config.save_path))
-
-
-    def update_process_bar(self,cur_num, total):
-        if not hasattr(self, 'progress_bar') or self.progress_bar is None:
-            self.progress_bar = ProgressBar(self)
-            self.progress_bar.show()
-        if self.progress_bar.isVisible() is False:
-            # 点击取消保存时，终止进程
-            self.btn2Thread_object.stop()
+    def export_single_image(self, source: str) -> None:
+        if self.draw_img is None:
+            QMessageBox.about(self, '提示', '请先检测一张图片再保存。')
             return
-        value = int(cur_num / max(total, 1) * 100)
-        self.progress_bar.setValue(cur_num, total, value)
-        QApplication.processEvents()
+        saved = tools.img_cvwrite(Path(Config.save_path) / tools.target_path_for(source).name, self.draw_img)
+        csv_path = tools.write_csv(
+            Path(Config.save_path) / f'{Path(source).stem}_detect_result.csv',
+            self.last_result.csv_rows(),
+        )
+        QMessageBox.about(self, '提示', f'图片保存成功！\n图片：{saved}\n数据：{csv_path}')
 
-    def video_save_completed(self, save_path):
-        if getattr(self, 'progress_bar', None) is not None:
+    def export_batch_images(self, directory: str) -> None:
+        images = tools.list_image_files(directory)
+        if not images:
+            QMessageBox.information(self, '提示', '所选文件夹中没有支持的图片。')
+            return
+        answer = QMessageBox.question(
+            self, '提示',
+            f'共 {len(images)} 张图片，导出检测后的图片与 CSV 可能需要较长时间，是否继续？',
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        self.run_image_worker(images, batch=False, persist=True)
+
+    def export_video(self, source: str) -> None:
+        answer = QMessageBox.question(
+            self, '提示', '保存视频检测结果可能需要较长时间，请确认是否继续保存？',
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
+        )
+        if answer != QMessageBox.Yes:
+            return
+
+        cap = open_video_capture(source)
+        if cap is None:
+            QMessageBox.critical(self, '打开失败', f'无法读取原视频：{source}')
+            return
+
+        total = max(int(cap.get(cv2.CAP_PROP_FRAME_COUNT)), 1)
+        fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+        size = (int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+        self.export_path = str(
+            Path(Config.save_path) / tools.target_path_for(source).with_suffix('.avi').name
+        )
+        writer = cv2.VideoWriter(self.export_path, cv2.VideoWriter_fourcc(*'XVID'), fps, size)
+        if not writer.isOpened():
+            cap.release()
+            QMessageBox.critical(self, '保存失败', f'无法创建输出视频：{self.export_path}')
+            return
+
+        self.cap = cap
+        self.writer = writer
+        self.export_total = total
+        self.export_current = 0
+        self._exporting = True
+        self._streaming = True  # 复用取帧流水线，但不做画面刷新
+        self._cancel_requested = False
+
+        self.show_progress(self.cancel_export)
+        self.frame_worker.configure(self.conf_thres, self.iou_thres, self.show_labels)
+        self.frame_worker.start()
+        self.capture_timer.start(0)  # 间隔 0：事件队列空闲即触发，等价于“尽快处理”
+
+    def cancel_export(self) -> None:
+        """点击“取消保存”：停止取帧与推理，已写入的部分保留。"""
+        self._cancel_requested = True
+        self.capture_timer.stop()
+        self.frame_worker.stop()
+
+    def write_export_frame(self, annotated) -> None:
+        if self.writer is None or self._cancel_requested:
+            return
+        self.writer.write(annotated)
+        self.export_current += 1
+        self.on_progress(self.export_current, self.export_total)
+
+    def check_export_finished(self) -> None:
+        """等待最后一帧推理完成，然后收尾。"""
+        if self.frame_worker.has_pending():
+            return
+        self.drain_timer.stop()
+        self.release_writer()
+        if self.frame_worker.isRunning():
+            self.frame_worker.wait(3000)
+        if self.cap is not None:
+            self.cap.release()
+            self.cap = None
+
+        saved, canceled = self.export_path, self._cancel_requested
+        finished = self.export_current >= self.export_total and not canceled
+        self.export_path = ''
+        self.export_total = 0
+        self.export_current = 0
+        self._exporting = False
+        self._streaming = False
+        self._cancel_requested = False
+        self.close_progress()
+
+        if canceled:
+            QMessageBox.information(self, '提示', f'已取消视频保存，已写入的部分在：\n{saved}')
+        elif finished:
+            QMessageBox.about(self, '提示', f'视频保存成功！\n文件路径：{saved}')
+        else:
+            QMessageBox.warning(self, '提示', f'视频未处理完（{self.export_total} 帧中有部分失败）：\n{saved}')
+
+    def release_writer(self) -> None:
+        if self.writer is not None:
+            self.writer.release()
+            self.writer = None
+
+    # ------------------------------------------------------------------ #
+    # 进度条 / 线程回调
+    # ------------------------------------------------------------------ #
+    def show_progress(self, on_cancel) -> None:
+        """显示进度条；on_cancel 在点“取消”时调用（用于停止后台任务）。"""
+        if self.progress_bar is None:
+            self.progress_bar = ProgressBar(self, on_cancel=on_cancel)
+        self.progress_bar.reset()
+        self.progress_bar.show()
+
+    def on_progress(self, current: int, total: int) -> None:
+        if self.progress_bar is None or not self.progress_bar.isVisible():
+            return
+        self.progress_bar.setValue(current, total, int(current / max(total, 1) * 100))
+
+    def on_worker_failed(self, message: str) -> None:
+        LOGGER.error('后台任务出错：%s', message)
+        self.close_progress()
+        if self._streaming:
+            self.stop_stream()
+        self._exporting = False
+        QMessageBox.critical(self, '任务失败', message)
+
+    def close_progress(self) -> None:
+        if self.progress_bar is not None:
             self.progress_bar.close()
             self.progress_bar = None
-        QMessageBox.about(self, '提示', f'视频保存成功!\n文件路径:{save_path}')
 
-    def video_save_failed(self, message):
-        if getattr(self, 'progress_bar', None) is not None:
-            self.progress_bar.close()
-            self.progress_bar = None
-        QMessageBox.critical(self, '视频保存失败', message)
-
-    # 添加新的槽函数
-    def update_conf_thres(self, value):
+    # ------------------------------------------------------------------ #
+    # 参数调整
+    # ------------------------------------------------------------------ #
+    def update_conf_thres(self, value: float) -> None:
         self.conf_thres = value
-        # 更新检测参数
-        if hasattr(self, 'model'):
-            self.model.conf = value
-            # 如果当前有图片，重新检测
-            if self.cap is None and hasattr(self, 'org_img'):
-                self.detect_current_image()
+        self.sync_worker_parameters()
+        self.redetect_timer.start()
 
-    def update_iou_thres(self, value):
+    def update_iou_thres(self, value: float) -> None:
         self.iou_thres = value
-        # 更新检测参数
-        if hasattr(self, 'model'):
-            self.model.iou = value
-            # 如果当前有图片，重新检测
-            if self.cap is None and hasattr(self, 'org_img'):
-                self.detect_current_image()
+        self.sync_worker_parameters()
+        self.redetect_timer.start()
 
-    def update_show_labels(self, state):
+    def update_show_labels(self, state) -> None:
         self.show_labels = state == Qt.Checked
-        # 如果当前有检测结果，重新绘制
-        if hasattr(self, 'results'):
-            self.draw_detection_results()
-
-    # 添加新方法用于重新检测当前图片
-    def detect_current_image(self):
-        if hasattr(self, 'org_img'):
-            t1 = time.time()
-            self.results = self.model(self.org_img, conf=self.conf_thres, iou=self.iou_thres)[0]
-            t2 = time.time()
-            take_time_str = '{:.3f} s'.format(t2 - t1)
-            self.time_lb.setText(take_time_str)
-
-            # 更新检测结果相关信息
-            location_list = self.results.boxes.xyxy.tolist()
-            self.location_list = [list(map(int, e)) for e in location_list]
-            cls_list = self.results.boxes.cls.tolist()
-            self.cls_list = [int(i) for i in cls_list]
-            self.conf_list = self.results.boxes.conf.tolist()
-            self.conf_list = ['%.2f %%' % (each*100) for each in self.conf_list]
-
-            # 更新目标数目
-            target_nums = len(self.cls_list)
-            self.label_nums.setText(str(target_nums))
-
-            # 重新设置目标选择下拉框
-            choose_list = ['全部']
-            target_names = [Config.names[id]+ '_'+ str(index) for index,id in enumerate(self.cls_list)]
-            choose_list = choose_list + target_names
-            self.comboBox.clear()
-            self.comboBox.addItems(choose_list)
-            self.comboBox.setCurrentIndex(0)  # 设置为"全部"
-
-            # 更新目标信息显示
-            if target_nums >= 1:
-                self.type_lb.setText(Config.CH_names[self.cls_list[0]])
-                self.label_conf.setText(str(self.conf_list[0]))
-                self.label_xmin.setText(str(self.location_list[0][0]))
-                self.label_ymin.setText(str(self.location_list[0][1]))
-                self.label_xmax.setText(str(self.location_list[0][2]))
-                self.label_ymax.setText(str(self.location_list[0][3]))
-            else:
-                self.type_lb.setText('')
-                self.label_conf.setText('')
-                self.label_xmin.setText('')
-                self.label_ymin.setText('')
-                self.label_xmax.setText('')
-                self.label_ymax.setText('')
-
-            # 更新表格信息
-            self.tableWidget.setRowCount(0)
-            self.tableWidget.clearContents()
-            self.tabel_info_show(self.location_list, self.cls_list, self.conf_list, path=self.org_path)
-
-            # 绘制检测结果
-            self.draw_detection_results()
-
-    # 添加新方法用于绘制检测结果
-    def draw_detection_results(self):
-        if not hasattr(self, 'results'):
+        self.sync_worker_parameters()
+        if self._streaming:  # 实时画面的下一帧自动生效
             return
-        
-        # 使用results.plot()作为基础图像
-        now_img = self.results.plot()
-        
-        # 如果不显示标签，重新绘制只有框的图像
-        if not self.show_labels:
-            now_img = self.org_img.copy()
-            for box in self.results.boxes:
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
-                cls = int(box.cls[0])
-                color = self.colors(cls, True)
-                cv2.rectangle(now_img, (x1, y1), (x2, y2), color, 2)
+        if self.org_img is None or len(self.last_result) == 0:
+            return
+        self.draw_img = tools.annotate_image(
+            self.org_img,
+            self.last_result.boxes,
+            self.last_result.classes,
+            self.last_result.confs,
+            show_labels=self.show_labels,
+        )
+        self.render_image(self.draw_img)
+        self.comboBox.blockSignals(True)
+        self.comboBox.setCurrentIndex(0)
+        self.comboBox.blockSignals(False)
+        self.update_target_panel(self.last_result, 0)
 
-        self.draw_img = now_img
-        # 更新显示
-        self.img_width, self.img_height = self.get_resize_size(now_img)
-        resize_cvimg = cv2.resize(now_img, (self.img_width, self.img_height))
-        pix_img = tools.cvimg_to_qpiximg(resize_cvimg)
-        self.label_show.setPixmap(pix_img)
-        self.label_show.setAlignment(Qt.AlignCenter)
+    def sync_worker_parameters(self) -> None:
+        for worker in (self.image_worker, self.frame_worker):
+            worker.configure_parameters(self.conf_thres, self.iou_thres, self.show_labels)
 
-    def closeEvent(self, event):
-        """关闭窗口时释放摄像头、视频和后台保存线程。"""
-        self.video_stop()
-        worker = getattr(self, 'btn2Thread_object', None)
-        if worker is not None and worker.isRunning():
-            worker.stop()
-            worker.wait(3000)
+    def redetect_current_image(self) -> None:
+        """阈值变化后对当前图片重新推理（去重抖后调用）。"""
+        if self._streaming or self._exporting or self.image_worker.isRunning():
+            return
+        source = self.last_result.source
+        if source and os.path.isfile(source):
+            self.detect_images([source], batch=False)
+
+    # ------------------------------------------------------------------ #
+    # 退出
+    # ------------------------------------------------------------------ #
+    def closeEvent(self, event) -> None:
+        """退出前释放摄像头、视频对象和后台线程。"""
+        self.export_path = ''
+        self.stop_stream()
+        if self.image_worker.isRunning():
+            self.image_worker.stop()
+            self.image_worker.wait(3000)
         event.accept()
 
 
-class btn2Thread(QThread):
-    """
-    进行检测后的视频保存
-    """
-    # 声明一个信号
-    update_ui_signal = pyqtSignal(int,int)
-    completed_signal = pyqtSignal(str)
-    error_signal = pyqtSignal(str)
-
-    def __init__(self, path, model, com_text,conf,iou):
-        super(btn2Thread, self).__init__()
-        self.org_path = path
-        self.model = model
-        self.com_text = com_text
-        self.conf = conf
-        self.iou = iou
-        # 用于绘制不同颜色矩形框
-        self.colors = tools.Colors()
-        self.is_running = True  # 标志位，表示线程是否正在运行
-
-    def run(self):
-        cap = None
-        out = None
-        save_video_path = ''
-        try:
-            cap = cv2.VideoCapture(self.org_path)
-            if not cap.isOpened():
-                raise RuntimeError('无法读取原视频。')
-            fourcc = cv2.VideoWriter_fourcc(*'XVID')
-            fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-            size = (int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
-            name = os.path.splitext(os.path.basename(self.org_path))[0]
-            save_video_path = os.path.join(Config.save_path, name + '_detect_result.avi')
-            out = cv2.VideoWriter(save_video_path, fourcc, fps, size)
-            if not out.isOpened():
-                raise RuntimeError(f'无法创建输出视频：{save_video_path}')
-
-            total = max(int(cap.get(cv2.CAP_PROP_FRAME_COUNT)), 1)
-            cur_num = 0
-            while cap.isOpened() and self.is_running:
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                cur_num += 1
-                results = self.model(frame, conf=self.conf, iou=self.iou)[0]
-                out.write(results.plot())
-                self.update_ui_signal.emit(cur_num, total)
-
-            if self.is_running:
-                self.completed_signal.emit(save_video_path)
-        except Exception as exc:
-            self.error_signal.emit(str(exc))
-        finally:
-            if cap is not None:
-                cap.release()
-            if out is not None:
-                out.release()
-
-    def stop(self):
-        self.is_running = False
-
-
-if __name__ == "__main__":
+def main() -> int:
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+    )
+    QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     app = QApplication(sys.argv)
-    win = MainWindow()
-    win.show()
-    sys.exit(app.exec_())
+    try:
+        window = MainWindow()
+    except FileNotFoundError as exc:
+        QMessageBox.critical(None, '启动失败', str(exc))
+        return 1
+    window.show()
+    return app.exec_()
+
+
+if __name__ == '__main__':
+    sys.exit(main())
