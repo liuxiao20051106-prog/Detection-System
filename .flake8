@@ -1,0 +1,11 @@
+[flake8]
+# UiMain.py / ui_sources_rc.py 由 pyuic5、pyrcc5 生成，不做检查
+exclude =
+    .git,
+    __pycache__,
+    .venv,
+    venv,
+    UIProgram/UiMain.py,
+    UIProgram/ui_sources_rc.py
+max-line-length = 120
+max-complexity = 15
